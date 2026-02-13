@@ -332,6 +332,7 @@ choose_image_target() {
   local loopdev="$1"
   local -a options=()
   local idx=1
+  local found_lvm=0
 
   TARGET_KIND=()
   TARGET_A=()
@@ -374,16 +375,27 @@ choose_image_target() {
         TARGET_D[$idx]="$lv_name"
         TARGET_LABEL[$idx]="LVM ${vg_name}/${lv_name} (${lv_fs})"
         idx=$((idx + 1))
+        found_lvm=1
       done <<<"$lv_rows"
-    elif [[ -n "$fstype" ]]; then
+    fi
+  done < <(lsblk -lnpo NAME,TYPE "$loopdev" | awk -v loopdev="$loopdev" '$2=="part" && $1!=loopdev {print $1}')
+
+  if [[ "$found_lvm" -eq 0 ]]; then
+    while read -r part; do
+      [[ -z "$part" || ! -b "$part" ]] && continue
+      [[ "$part" == "$loopdev" ]] && continue
+
+      fstype="$(blkid -o value -s TYPE "$part" 2>/dev/null || true)"
+      [[ -z "$fstype" || "$fstype" == "LVM2_member" ]] && continue
+
       options+=("$idx" "Partition ${part} (${fstype})")
       TARGET_KIND[$idx]="part"
       TARGET_A[$idx]="$part"
       TARGET_B[$idx]="$fstype"
       TARGET_LABEL[$idx]="Partition ${part} (${fstype})"
       idx=$((idx + 1))
-    fi
-  done < <(lsblk -lnpo NAME,TYPE "$loopdev" | awk -v loopdev="$loopdev" '$2=="part" && $1!=loopdev {print $1}')
+    done < <(lsblk -lnpo NAME,TYPE "$loopdev" | awk -v loopdev="$loopdev" '$2=="part" && $1!=loopdev {print $1}')
+  fi
 
   if [[ "${#options[@]}" -eq 0 ]]; then
     show_error "No mountable partition or logical volume found in ${loopdev}."
