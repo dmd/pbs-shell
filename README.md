@@ -22,7 +22,7 @@ Requires Docker. Tested on Linux (amd64) and MacOS (arm64).
 ## Filesystem and LVM behavior
 
 - Image target selection supports both partitions and LVs.
-- Supports ext2/3/4 and XFS.
+- Supports ext2/3/4, XFS, and btrfs.
 
 ## Image
 
@@ -50,7 +50,7 @@ By default, `./pbs-browse.sh`:
 Useful overrides:
 
 ```bash
-AUTH_FILE=/path/to/auth.env IMAGE=ghcr.io/dmd/pbs-shell:v0.1.0 ./pbs-browse.sh
+AUTH_FILE=/path/to/auth.env IMAGE=ghcr.io/dmd/pbs-shell:v0.1.2 ./pbs-browse.sh
 ```
 
 ```bash
