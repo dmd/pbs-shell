@@ -4,6 +4,7 @@ set -eu
 IMAGE="${IMAGE:-ghcr.io/dmd/pbs-shell:latest}"
 AUTH_FILE="${AUTH_FILE:-${PWD}/auth.env}"
 PULL_IMAGE="${PULL_IMAGE:-1}"
+LVM_SUPPRESS_FD_WARNINGS="${LVM_SUPPRESS_FD_WARNINGS:-1}"
 
 if [ ! -f "$AUTH_FILE" ]; then
   echo "auth file not found: $AUTH_FILE" >&2
@@ -25,5 +26,6 @@ docker run --rm -it \
   --device /dev/fuse \
   --cap-add SYS_ADMIN \
   --security-opt apparmor:unconfined \
+  -e "LVM_SUPPRESS_FD_WARNINGS=${LVM_SUPPRESS_FD_WARNINGS}" \
   -v "${AUTH_FILE}:/app/auth.env:ro" \
   "$IMAGE"
