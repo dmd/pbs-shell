@@ -345,6 +345,7 @@ choose_image_target() {
   local part fstype
   while read -r part; do
     [[ -z "$part" || ! -b "$part" ]] && continue
+    [[ "$part" == "$loopdev" ]] && continue
 
     fstype="$(blkid -o value -s TYPE "$part" 2>/dev/null || true)"
 
@@ -382,7 +383,7 @@ choose_image_target() {
       TARGET_LABEL[$idx]="Partition ${part} (${fstype})"
       idx=$((idx + 1))
     fi
-  done < <(lsblk -lnpo NAME,TYPE "$loopdev" | awk '$2=="part" {print $1}')
+  done < <(lsblk -lnpo NAME,TYPE "$loopdev" | awk -v loopdev="$loopdev" '$2=="part" && $1!=loopdev {print $1}')
 
   if [[ "${#options[@]}" -eq 0 ]]; then
     show_error "No mountable partition or logical volume found in ${loopdev}."
