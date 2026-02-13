@@ -5,7 +5,7 @@ and then providing a shell for exploration.
 
 Requires Docker. Tested on Linux (amd64) and MacOS (arm64).
 
-[![asciicast](https://asciinema.org/a/aav2JNC8tldJ6jjv.svg)](https://asciinema.org/a/aav2JNC8tldJ6jjv)
+[![asciicast](https://asciinema.org/a/WDWCcR7KZMmzsCFk.svg)](https://asciinema.org/a/WDWCcR7KZMmzsCFk)
 
 ## What it does
 
