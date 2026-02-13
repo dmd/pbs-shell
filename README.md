@@ -32,6 +32,20 @@ Requires Docker. Tested on Linux (amd64) and MacOS (arm64).
 docker build -t pbs-snapshot-browser .
 ```
 
+## Published image
+
+GitHub Actions automatically builds and publishes a multi-arch image
+(`linux/amd64`, `linux/arm64`) to GHCR:
+
+```bash
+ghcr.io/<owner>/pbs-shell:latest
+```
+
+Publishing triggers:
+- push to `main`
+- push tags matching `v*`
+- manual `workflow_dispatch`
+
 ## Auth file
 
 By default the container reads `auth.env` in the current directory; see `auth.env.dist` for format.
@@ -43,5 +57,4 @@ The `PBS_USER` you use must have `DatastoreReader` rights.
 ```bash
 ./pbs-browse.sh
 ```
-
 
