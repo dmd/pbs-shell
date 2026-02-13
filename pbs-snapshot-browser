@@ -1,0 +1,507 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+APP="pbs-snapshot-browser"
+MOUNT_ROOT="/mnt/pbs"
+MOUNT_DIR="${MOUNT_ROOT}/active"
+
+LOOPDEV=""
+BACKEND=""
+DM_NAME=""
+TARGET_SELECTION=""
+LAST_ERROR=""
+GROUP_SELECTION=""
+GROUP_LABEL=""
+
+require_cmd() {
+  local cmd="$1"
+  command -v "$cmd" >/dev/null 2>&1 || {
+    echo "[$APP] missing command: $cmd" >&2
+    exit 1
+  }
+}
+
+trim() {
+  awk '{$1=$1; print}' <<<"$*"
+}
+
+pbs() {
+  proxmox-backup-client "$@"
+}
+
+cleanup() {
+  set +e
+
+  if mountpoint -q "$MOUNT_DIR"; then
+    case "$BACKEND" in
+      pxar)
+        fusermount3 -u "$MOUNT_DIR" >/dev/null 2>&1 || umount -l "$MOUNT_DIR" >/dev/null 2>&1
+        ;;
+      *)
+        umount "$MOUNT_DIR" >/dev/null 2>&1 || umount -l "$MOUNT_DIR" >/dev/null 2>&1
+        ;;
+    esac
+  fi
+
+  if [[ -n "$DM_NAME" ]]; then
+    dmsetup remove "$DM_NAME" >/dev/null 2>&1 || true
+  fi
+
+  if [[ -n "$LOOPDEV" ]]; then
+    pbs unmap "$LOOPDEV" >/dev/null 2>&1 || true
+    # In containers, proxmox unmap can occasionally time out while loop
+    # devices remain attached. Detach defensively to avoid leaked loop devices.
+    losetup -d "$LOOPDEV" >/dev/null 2>&1 || true
+  fi
+}
+
+show_error() {
+  whiptail --title "Error" --msgbox "$1" 12 90
+}
+
+mount_readonly() {
+  local dev="$1"
+  local mp="$2"
+  local fstype err
+
+  fstype="$(probe_block_fstype "$dev")"
+  case "$fstype" in
+    xfs)
+      err="$(mount -t xfs -o ro,nouuid,norecovery "$dev" "$mp" 2>&1)" || {
+        LAST_ERROR="${err}"
+        return 1
+      }
+      return
+      ;;
+    ext2|ext3|ext4)
+      err="$(mount -t "$fstype" -o ro,noload "$dev" "$mp" 2>&1)" || {
+        LAST_ERROR="${err}"
+        return 1
+      }
+      return
+      ;;
+    btrfs)
+      err="$(mount -t btrfs -o ro "$dev" "$mp" 2>&1)" || {
+        LAST_ERROR="${err}"
+        return 1
+      }
+      return
+      ;;
+  esac
+
+  # Fallbacks when signature probing is inconclusive on mapped devices.
+  err="$(mount -o ro "$dev" "$mp" 2>&1)" && return || LAST_ERROR="${err}"
+  err="$(mount -t xfs -o ro,nouuid,norecovery "$dev" "$mp" 2>&1)" && return || LAST_ERROR="${err}"
+  err="$(mount -t ext4 -o ro,noload "$dev" "$mp" 2>&1)" && return || LAST_ERROR="${err}"
+  err="$(mount -t ext3 -o ro,noload "$dev" "$mp" 2>&1)" && return || LAST_ERROR="${err}"
+  err="$(mount -t ext2 -o ro,noload "$dev" "$mp" 2>&1)" && return || LAST_ERROR="${err}"
+  err="$(mount -t btrfs -o ro "$dev" "$mp" 2>&1)" && return || LAST_ERROR="${err}"
+
+  return 1
+}
+
+probe_block_fstype() {
+  local dev="$1"
+  blkid -p -o value -s TYPE "$dev" 2>/dev/null || blkid -o value -s TYPE "$dev" 2>/dev/null || true
+}
+
+build_lvm_table() {
+  local pv="$1"
+  local vg_name="$2"
+  local lv_name="$3"
+
+  local cfg pe_start pe_size table
+  cfg="devices { filter=[\"a|^${pv}$|\",\"r|.*|\"] }"
+
+  pe_start="$(( $(lvm pvs --config "$cfg" --units s --nosuffix --noheadings -o pe_start "$pv" | awk '{gsub(/ /, ""); sub(/s$/, ""); print int($1)}') ))" || {
+    LAST_ERROR="Unable to read PV extent start for ${pv}"
+    return 1
+  }
+  pe_size="$(( $(lvm vgs --config "$cfg" --units s --nosuffix --noheadings -o vg_extent_size "$vg_name" | awk '{gsub(/ /, ""); sub(/s$/, ""); print int($1)}') ))" || {
+    LAST_ERROR="Unable to read VG extent size for ${vg_name}"
+    return 1
+  }
+
+  table="$(lvm lvs --config "$cfg" --noheadings --separator '|' -o seg_start_pe,seg_size_pe,devices "${vg_name}/${lv_name}" | awk -F'|' -v ps="$pe_size" -v pstart="$pe_start" '
+    function trim(s) { gsub(/^ +| +$/, "", s); return s }
+    {
+      seg_start = trim($1)
+      seg_size  = trim($2)
+      devs      = trim($3)
+      if (seg_start == "" || seg_size == "" || devs == "") next
+      if (index(devs, ",") > 0) {
+        print "" > "/dev/stderr"
+        exit 2
+      }
+      pvdev = devs
+      sub(/\(.*/, "", pvdev)
+      pvpe = devs
+      sub(/^.*\(/, "", pvpe)
+      sub(/\).*/, "", pvpe)
+      if (pvdev == "" || pvpe == "") next
+      start = seg_start * ps
+      len   = seg_size * ps
+      off   = pstart + pvpe * ps
+      printf "%d %d linear %s %d\n", start, len, pvdev, off
+    }
+  ' 2>/dev/null)"
+
+  if [[ -z "$table" ]]; then
+    LAST_ERROR="Unable to build mapping table for ${vg_name}/${lv_name}"
+    return 1
+  fi
+
+  printf '%s\n' "$table"
+}
+
+probe_lvm_fstype() {
+  local pv="$1"
+  local vg_name="$2"
+  local vg_uuid="$3"
+  local lv_name="$4"
+
+  local table dm_name fstype
+  table="$(build_lvm_table "$pv" "$vg_name" "$lv_name")" || return 1
+
+  dm_name="pbs-probe-${vg_uuid//-/}-${lv_name//[^a-zA-Z0-9._-]/_}-$$-$RANDOM"
+  dmsetup remove "$dm_name" >/dev/null 2>&1 || true
+  if ! dmsetup create "$dm_name" --readonly --table "$table" >/dev/null 2>&1; then
+    LAST_ERROR="Failed creating probe mapping for ${vg_name}/${lv_name}"
+    return 1
+  fi
+  dmsetup mknodes >/dev/null 2>&1 || true
+
+  fstype="$(probe_block_fstype "/dev/mapper/${dm_name}")"
+  dmsetup remove "$dm_name" >/dev/null 2>&1 || true
+
+  printf '%s\n' "$fstype"
+}
+
+load_auth() {
+  local auth_file="${AUTH_FILE:-/app/auth.env}"
+  if [[ -f "$auth_file" ]]; then
+    set -a
+    # shellcheck source=/dev/null
+    source "$auth_file"
+    set +a
+  fi
+
+  : "${PBS_REPOSITORY:?Set PBS_REPOSITORY or provide AUTH_FILE with PBS_REPOSITORY}"
+  : "${PBS_PASSWORD:?Set PBS_PASSWORD or provide AUTH_FILE with PBS_PASSWORD}"
+
+  export PBS_REPOSITORY
+  export PBS_PASSWORD
+}
+
+ensure_runtime_dir() {
+  if [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
+    export XDG_RUNTIME_DIR="/tmp/pbs-runtime-$$"
+  fi
+  mkdir -p "$XDG_RUNTIME_DIR"
+  chmod 700 "$XDG_RUNTIME_DIR" 2>/dev/null || true
+}
+
+menu_select() {
+  local title="$1"
+  local prompt="$2"
+  shift 2
+  whiptail --title "$title" --menu "$prompt" 24 110 16 "$@" 3>&1 1>&2 2>&3
+}
+
+choose_group() {
+  local groups_json
+  groups_json="$(pbs list --output-format json)"
+
+  local -a options=()
+  while IFS=$'\t' read -r group desc; do
+    options+=("$group" "$desc")
+  done < <(
+    jq -r '
+      [ .[] | {
+          group: (."backup-type" + "/" + ."backup-id"),
+          desc: (.comment // ."backup-id")
+        }
+      ]
+      | sort_by(.desc, .group)
+      | .[]
+      | [.group, .desc]
+      | @tsv
+    ' <<<"$groups_json"
+  )
+
+  if [[ "${#options[@]}" -eq 0 ]]; then
+    show_error "No backup groups found."
+    exit 1
+  fi
+
+  GROUP_SELECTION="$(menu_select "PBS Backup Group" "Choose a backup group" "${options[@]}")"
+  GROUP_LABEL="$(jq -r --arg group "$GROUP_SELECTION" '
+    [ .[] | {
+        group: (."backup-type" + "/" + ."backup-id"),
+        desc: (.comment // ."backup-id")
+      }
+    ]
+    | map(select(.group == $group))
+    | if length > 0 then .[0].desc else $group end
+  ' <<<"$groups_json")"
+}
+
+choose_snapshot() {
+  local group="$1"
+  local snaps_json
+  snaps_json="$(pbs snapshot list "$group" --output-format json)"
+
+  local -a options=()
+  while IFS=$'\t' read -r epoch size; do
+    local iso display_size
+    iso="$(date -u -d "@${epoch}" +%Y-%m-%dT%H:%M:%SZ)"
+    display_size="$(numfmt --to=iec-i --suffix=B "$size" 2>/dev/null || echo "$size")"
+    options+=("${group}/${iso}" "size: ${display_size}")
+  done < <(jq -r 'sort_by(."backup-time") | reverse | .[] | [."backup-time", (.size // 0)] | @tsv' <<<"$snaps_json")
+
+  if [[ "${#options[@]}" -eq 0 ]]; then
+    show_error "No snapshots found for ${group}."
+    exit 1
+  fi
+
+  menu_select "PBS Snapshot" "Choose a snapshot" "${options[@]}"
+}
+
+choose_archive() {
+  local snapshot="$1"
+  local files_json
+  files_json="$(pbs snapshot files "$snapshot" --output-format json)"
+
+  local -a options=()
+  while IFS=$'\t' read -r filename desc; do
+    options+=("$filename" "$desc")
+  done < <(
+    jq -r '
+      .[]
+      | select(.filename)
+      | .filename as $f
+      | if ($f | test("\\.(p|m|pp)xar\\.didx$")) then
+          [$f, "pxar archive"]
+        elif ($f | test("\\.img\\.fidx$")) then
+          [$f, "disk image"]
+        else
+          empty
+        end
+      | @tsv
+    ' <<<"$files_json"
+  )
+
+  if [[ "${#options[@]}" -eq 0 ]]; then
+    show_error "No mountable archive found in ${snapshot}."
+    exit 1
+  fi
+
+  menu_select "Snapshot Archive" "Choose an archive to mount" "${options[@]}"
+}
+
+map_image() {
+  local snapshot="$1"
+  local archive="$2"
+  local out
+
+  out="$(pbs map "$snapshot" "$archive" 2>&1 || true)"
+  LOOPDEV="$(grep -Eo '/dev/loop[0-9]+' <<<"$out" | head -n1 || true)"
+
+  if [[ -z "$LOOPDEV" ]]; then
+    show_error "Unable to map image:\n\n$out"
+    exit 1
+  fi
+}
+
+ensure_partition_nodes() {
+  local loopdev="$1"
+
+  while read -r dev majmin type; do
+    [[ "$type" != "part" ]] && continue
+    [[ -b "$dev" ]] && continue
+
+    local major minor
+    major="${majmin%%:*}"
+    minor="${majmin##*:}"
+    mknod "$dev" b "$major" "$minor" || true
+    chmod 660 "$dev" || true
+  done < <(lsblk -lnpo NAME,MAJ:MIN,TYPE "$loopdev")
+}
+
+choose_image_target() {
+  local loopdev="$1"
+  local -a options=()
+  local idx=1
+
+  TARGET_KIND=()
+  TARGET_A=()
+  TARGET_B=()
+  TARGET_C=()
+  TARGET_D=()
+  TARGET_LABEL=()
+
+  ensure_partition_nodes "$loopdev"
+
+  local part fstype
+  while read -r part; do
+    [[ -z "$part" || ! -b "$part" ]] && continue
+
+    fstype="$(blkid -o value -s TYPE "$part" 2>/dev/null || true)"
+
+    if [[ "$fstype" == "LVM2_member" ]]; then
+      local cfg vg_name vg_uuid lv_rows
+      cfg="devices { filter=[\"a|^${part}$|\",\"r|.*|\"] }"
+      vg_name="$(trim "$(lvm pvs --config "$cfg" --noheadings -o vg_name "$part" 2>/dev/null || true)")"
+      vg_uuid="$(trim "$(lvm pvs --config "$cfg" --noheadings -o vg_uuid "$part" 2>/dev/null || true)")"
+      [[ -z "$vg_name" || -z "$vg_uuid" ]] && continue
+
+      lv_rows="$(lvm lvs --config "$cfg" --noheadings --separator '|' -o lv_name,lv_size "$vg_name" 2>/dev/null || true)"
+      while IFS='|' read -r lv_name lv_size; do
+        local lv_fs
+        lv_name="$(trim "$lv_name")"
+        lv_size="$(trim "$lv_size")"
+        [[ -z "$lv_name" ]] && continue
+
+        lv_fs="$(probe_lvm_fstype "$part" "$vg_name" "$vg_uuid" "$lv_name" || true)"
+        [[ -z "$lv_fs" ]] && lv_fs="unknown"
+
+        options+=("$idx" "LVM ${vg_name}/${lv_name} (${lv_size}, ${lv_fs})")
+        TARGET_KIND[$idx]="lvm"
+        TARGET_A[$idx]="$part"
+        TARGET_B[$idx]="$vg_name"
+        TARGET_C[$idx]="$vg_uuid"
+        TARGET_D[$idx]="$lv_name"
+        TARGET_LABEL[$idx]="LVM ${vg_name}/${lv_name} (${lv_fs})"
+        idx=$((idx + 1))
+      done <<<"$lv_rows"
+    elif [[ -n "$fstype" ]]; then
+      options+=("$idx" "Partition ${part} (${fstype})")
+      TARGET_KIND[$idx]="part"
+      TARGET_A[$idx]="$part"
+      TARGET_B[$idx]="$fstype"
+      TARGET_LABEL[$idx]="Partition ${part} (${fstype})"
+      idx=$((idx + 1))
+    fi
+  done < <(lsblk -lnpo NAME,TYPE "$loopdev" | awk '$2=="part" {print $1}')
+
+  if [[ "${#options[@]}" -eq 0 ]]; then
+    show_error "No mountable partition or logical volume found in ${loopdev}."
+    exit 1
+  fi
+
+  TARGET_SELECTION="$(menu_select "Image Target" "Choose a partition or LV" "${options[@]}")"
+}
+
+mount_lvm_via_dm() {
+  local pv="$1"
+  local vg_name="$2"
+  local vg_uuid="$3"
+  local lv_name="$4"
+
+  local table dm_name
+  table="$(build_lvm_table "$pv" "$vg_name" "$lv_name")" || return 1
+
+  dm_name="pbs-${vg_uuid//-/}-${lv_name//[^a-zA-Z0-9._-]/_}-$$"
+  dmsetup remove "$dm_name" >/dev/null 2>&1 || true
+  local err
+  err="$(dmsetup create "$dm_name" --readonly --table "$table" 2>&1)" || {
+    LAST_ERROR="${err}"
+    return 1
+  }
+  dmsetup mknodes
+  DM_NAME="$dm_name"
+
+  if ! mount_readonly "/dev/mapper/${dm_name}" "$MOUNT_DIR"; then
+    return 1
+  fi
+  BACKEND="dm"
+}
+
+mount_partition() {
+  local part="$1"
+  mount_readonly "$part" "$MOUNT_DIR"
+  BACKEND="partition"
+}
+
+open_shell() {
+  local what="$1"
+  local prompt_host="$2"
+  local prompt_fs="$3"
+  whiptail --title "Mounted" --msgbox "Mounted: ${what}\n\nPath: ${MOUNT_DIR}\n\nA shell will open now. Type 'exit' to unmount and finish." 12 100
+  cd "$MOUNT_DIR"
+  [[ -z "$prompt_host" ]] && prompt_host="unknown"
+  if [[ -n "$prompt_fs" ]]; then
+    export PS1="(${prompt_host} @ PBS ${prompt_fs})# "
+  else
+    export PS1="(${prompt_host} @ PBS)# "
+  fi
+  bash --noprofile --norc -i
+}
+
+main() {
+  trap cleanup EXIT
+
+  require_cmd proxmox-backup-client
+  require_cmd jq
+  require_cmd whiptail
+  require_cmd lvm
+  require_cmd dmsetup
+  require_cmd mount
+  require_cmd lsblk
+  require_cmd blkid
+  require_cmd losetup
+
+  mkdir -p "$MOUNT_DIR"
+  ensure_runtime_dir
+  load_auth
+
+  local group snapshot archive fs_label
+  choose_group
+  group="$GROUP_SELECTION"
+  snapshot="$(choose_snapshot "$group")"
+  archive="$(choose_archive "$snapshot")"
+
+  if [[ "$archive" =~ \.(p|m|pp)xar\.didx$ ]]; then
+    pbs mount "$snapshot" "$archive" "$MOUNT_DIR"
+    BACKEND="pxar"
+    open_shell "$snapshot / $archive" "$GROUP_LABEL" "$archive"
+    exit 0
+  fi
+
+  if [[ "$archive" =~ \.img\.fidx$ ]]; then
+    local target idx
+    map_image "$snapshot" "$archive"
+    choose_image_target "$LOOPDEV"
+    target="$TARGET_SELECTION"
+    idx="$target"
+
+    case "${TARGET_KIND[$idx]:-}" in
+      part)
+        if ! mount_partition "${TARGET_A[$idx]}"; then
+          show_error "Failed to mount partition ${TARGET_A[$idx]}\n\n${LAST_ERROR}"
+          exit 1
+        fi
+        fs_label="${TARGET_LABEL[$idx]:-${TARGET_A[$idx]}}"
+        open_shell "$snapshot / $archive / ${TARGET_A[$idx]}" "$GROUP_LABEL" "$fs_label"
+        ;;
+      lvm)
+        if ! mount_lvm_via_dm "${TARGET_A[$idx]}" "${TARGET_B[$idx]}" "${TARGET_C[$idx]}" "${TARGET_D[$idx]}"; then
+          show_error "Failed to mount LV ${TARGET_B[$idx]}/${TARGET_D[$idx]}\n\n${LAST_ERROR}"
+          exit 1
+        fi
+        fs_label="${TARGET_LABEL[$idx]:-${TARGET_B[$idx]}/${TARGET_D[$idx]}}"
+        open_shell "$snapshot / $archive / ${TARGET_B[$idx]}/${TARGET_D[$idx]}" "$GROUP_LABEL" "$fs_label"
+        ;;
+      *)
+        show_error "Unknown target selection."
+        exit 1
+        ;;
+    esac
+    exit 0
+  fi
+
+  show_error "Unsupported archive type: ${archive}"
+  exit 1
+}
+
+main "$@"
