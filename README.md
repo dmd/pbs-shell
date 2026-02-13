@@ -5,6 +5,8 @@ and then providing a shell for exploration.
 
 Requires Docker. Tested on Linux (amd64) and MacOS (arm64).
 
+[![asciicast](https://asciinema.org/a/aav2JNC8tldJ6jjv.svg)](https://asciinema.org/a/aav2JNC8tldJ6jjv)
+
 ## What it does
 
 - Uses `proxmox-backup-client` + `pxar` binaries with architecture-specific source policy:
@@ -42,5 +44,4 @@ The `PBS_USER` you use must have `DatastoreReader` rights.
 ./pbs-browse.sh
 ```
 
-[![asciicast](https://asciinema.org/a/aav2JNC8tldJ6jjv.svg)](https://asciinema.org/a/aav2JNC8tldJ6jjv)
 
