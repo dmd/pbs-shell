@@ -24,9 +24,17 @@ Requires Docker. Tested on Linux (amd64) and MacOS (arm64).
 - Image target selection supports both partitions and LVs.
 - Should support ext2/3/4 and XFS.
 
-## Build
+## Image
 
-`./pbs-browse.sh` will build for you, but you can do it yourself with
+`./pbs-browse.sh` uses the published image by default:
+
+```bash
+ghcr.io/dmd/pbs-shell:latest
+```
+
+Override it with `IMAGE=...` if needed.
+
+## Build (optional, for local development)
 
 ```bash
 docker build -t pbs-snapshot-browser .
@@ -38,7 +46,7 @@ GitHub Actions automatically builds and publishes a multi-arch image
 (`linux/amd64`, `linux/arm64`) to GHCR:
 
 ```bash
-ghcr.io/<owner>/pbs-shell:latest
+ghcr.io/dmd/pbs-shell:latest
 ```
 
 Publishing triggers:
@@ -58,3 +66,17 @@ The `PBS_USER` you use must have `DatastoreReader` rights.
 ./pbs-browse.sh
 ```
 
+By default, `./pbs-browse.sh`:
+- reads `./auth.env`
+- pulls `ghcr.io/dmd/pbs-shell:latest`
+- runs the container with required privileges/devices
+
+Useful overrides:
+
+```bash
+AUTH_FILE=/path/to/auth.env IMAGE=ghcr.io/dmd/pbs-shell:v0.1.0 ./pbs-browse.sh
+```
+
+```bash
+PULL_IMAGE=0 IMAGE=pbs-snapshot-browser ./pbs-browse.sh
+```

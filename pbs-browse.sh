@@ -1,19 +1,21 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/usr/bin/env sh
+set -eu
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-IMAGE="${IMAGE:-pbs-snapshot-browser}"
-AUTH_FILE="${AUTH_FILE:-${SCRIPT_DIR}/auth.env}"
+IMAGE="${IMAGE:-ghcr.io/dmd/pbs-shell:latest}"
+AUTH_FILE="${AUTH_FILE:-${PWD}/auth.env}"
+PULL_IMAGE="${PULL_IMAGE:-1}"
 
-if [[ ! -f "$AUTH_FILE" ]]; then
+if [ ! -f "$AUTH_FILE" ]; then
   echo "auth file not found: $AUTH_FILE" >&2
   exit 1
 fi
 
-if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
-  echo "image not found locally: $IMAGE"
-  echo "building image from ${SCRIPT_DIR}/Dockerfile ..."
-  docker build -t "$IMAGE" "$SCRIPT_DIR"
+if [ "$PULL_IMAGE" = "1" ]; then
+  echo "pulling image: $IMAGE"
+  docker pull "$IMAGE"
+elif ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+  echo "image not found locally and PULL_IMAGE=0: $IMAGE" >&2
+  exit 1
 fi
 
 docker run --rm -it \
