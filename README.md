@@ -42,3 +42,5 @@ The `PBS_USER` you use must have `DatastoreReader` rights.
 ./pbs-browse.sh
 ```
 
+[![asciicast](https://asciinema.org/a/aav2JNC8tldJ6jjv.svg)](https://asciinema.org/a/aav2JNC8tldJ6jjv)
+
